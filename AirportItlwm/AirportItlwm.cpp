@@ -33,40 +33,15 @@ bool AirportItlwm::init(OSDictionary *properties)
     return ret;
 }
 
-#define  PCI_MSI_FLAGS        2    /* Message Control */
-#define  PCI_CAP_ID_MSI        0x05    /* Message Signalled Interrupts */
-#define  PCI_MSIX_FLAGS        2    /* Message Control */
-#define  PCI_CAP_ID_MSIX    0x11    /* MSI-X */
-#define  PCI_MSIX_FLAGS_ENABLE    0x8000    /* MSI-X enable */
-#define  PCI_MSI_FLAGS_ENABLE    0x0001    /* MSI feature enabled */
-
-static void pciMsiSetEnable(IOPCIDevice *device, UInt8 msiCap, int enable)
-{
-    u16 control;
-    
-    control = device->configRead16(msiCap + PCI_MSI_FLAGS);
-    control &= ~PCI_MSI_FLAGS_ENABLE;
-    if (enable)
-        control |= PCI_MSI_FLAGS_ENABLE;
-    device->configWrite16(msiCap + PCI_MSI_FLAGS, control);
-}
-
-static void pciMsiXClearAndSet(IOPCIDevice *device, UInt8 msixCap, UInt16 clear, UInt16 set)
-{
-    u16 ctrl;
-    
-    ctrl = device->configRead16(msixCap + PCI_MSIX_FLAGS);
-    ctrl &= ~clear;
-    ctrl |= set;
-    device->configWrite16(msixCap + PCI_MSIX_FLAGS, ctrl);
-}
 
 IOService* AirportItlwm::probe(IOService *provider, SInt32 *score)
 {
     bool isMatch = false;
+    if (__IO80211_TARGET != kernel_version_map[version_major]) {
+        XYLog("%s Please use the correct kext version corresponding to the OS!!!\n", __FUNCTION__);
+        return NULL;
+    }
     super::probe(provider, score);
-    UInt8 msiCap;
-    UInt8 msixCap;
     IOPCIDevice* device = OSDynamicCast(IOPCIDevice, provider);
     if (!device)
         return NULL;
@@ -82,22 +57,9 @@ IOService* AirportItlwm::probe(IOService *provider, SInt32 *score)
         isMatch = true;
         fHalService = new ItlIwn;
     }
-    if (isMatch) {
-        device->findPCICapability(PCI_CAP_ID_MSIX, &msixCap);
-        if (msixCap)
-            pciMsiXClearAndSet(device, msixCap, PCI_MSIX_FLAGS_ENABLE, 0);
-        device->findPCICapability(PCI_CAP_ID_MSI, &msiCap);
-        if (msiCap)
-            pciMsiSetEnable(device, msiCap, 1);
-        if (!msiCap && !msixCap) {
-            XYLog("%s No MSI cap\n", __FUNCTION__);
-            fHalService->release();
-            fHalService = NULL;
-            return NULL;
-        }
-        return this;
+
     }
-    return NULL;
+    return isMatch ? this : NULL;
 }
 
 bool AirportItlwm::configureInterface(IONetworkInterface *netif)
@@ -321,7 +283,7 @@ createMediumTables(const IONetworkMedium **primary)
         return false;
     }
     
-    medium = IONetworkMedium::medium(0x80, 11000000);
+    medium = IONetworkMedium::medium(kIOMediumIEEE80211Auto, 11000000);
     IONetworkMedium::addMedium(mediumDict, medium);
     medium->release();
     if (primary) {
@@ -371,7 +333,7 @@ bool AirportItlwm::start(IOService *provider)
         releaseAll();
         return false;
     }
-    _fCommandGate = IOCommandGate::commandGate(this, (IOCommandGate::Action)AirportItlwm::tsleepHandler);
+    _fCommandGate = IOCommandGate::commandGate(this);
     if (_fCommandGate == 0) {
         XYLog("No command gate!!\n");
         super::stop(pciNub);
@@ -528,6 +490,7 @@ setLinkStatus(UInt32 status, const IONetworkMedium * activeMedium, UInt64 speed,
 #ifdef __PRIVATE_SPI__
             fNetIf->startOutputThread();
 #endif
+
             getCommandGate()->runAction(setLinkStateGated, (void *)kIO80211NetworkLinkUp, (void *)0);
             fNetIf->setLinkQualityMetric(100);
         } else if (!(status & kIONetworkLinkNoNetworkChange)) {
@@ -537,6 +500,7 @@ setLinkStatus(UInt32 status, const IONetworkMedium * activeMedium, UInt64 speed,
 #endif
             ifq_flush(&ifq->if_snd);
             mq_purge(&fHalService->get80211Controller()->ic_mgtq);
+
             getCommandGate()->runAction(setLinkStateGated, (void *)kIO80211NetworkLinkDown, (void *)fHalService->get80211Controller()->ic_deauth_reason);
         }
     }
@@ -680,11 +644,10 @@ IOReturn AirportItlwm::outputStart(IONetworkInterface *interface, IOOptionBits o
 {
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     mbuf_t m = NULL;
-    if (ifq_is_oactive(&ifp->if_snd))
+
         return kIOReturnNoResources;
     while (kIOReturnSuccess == interface->dequeueOutputPackets(1, &m)) {
-        if (outputPacket(m, NULL)!= kIOReturnOutputSuccess ||
-            ifq_is_oactive(&ifp->if_snd))
+
             return kIOReturnNoResources;
     }
     return kIOReturnSuccess;
@@ -698,7 +661,7 @@ UInt32 AirportItlwm::outputPacket(mbuf_t m, void *param)
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     
     if (fHalService->get80211Controller()->ic_state != IEEE80211_S_RUN || ifp->if_snd.queue == NULL) {
-        if (m && mbuf_type(m) != MBUF_TYPE_FREE)
+
             freePacket(m);
         return kIOReturnOutputDropped;
     }
@@ -772,28 +735,6 @@ IOReturn AirportItlwm::getPacketFilters(const OSSymbol *group, UInt32 *filters) 
     else
         rtn = IOEthernetController::getPacketFilters(group, filters);
     return rtn;
-}
-
-IOReturn AirportItlwm::
-tsleepHandler(OSObject* owner, void* arg0, void* arg1, void* arg2, void* arg3)
-{
-    AirportItlwm* dev = OSDynamicCast(AirportItlwm, owner);
-    if (dev == 0)
-        return kIOReturnError;
-    
-    if (arg1 == 0) {
-        if (_fCommandGate->commandSleep(arg0, THREAD_INTERRUPTIBLE) == THREAD_AWAKENED)
-            return kIOReturnSuccess;
-        else
-            return kIOReturnTimeout;
-    } else {
-        AbsoluteTime deadline;
-        clock_interval_to_deadline((*(int*)arg1), kNanosecondScale, reinterpret_cast<uint64_t*> (&deadline));
-        if (_fCommandGate->commandSleep(arg0, deadline, THREAD_INTERRUPTIBLE) == THREAD_AWAKENED)
-            return kIOReturnSuccess;
-        else
-            return kIOReturnTimeout;
-    }
 }
 
 static IOPMPowerState powerStateArray[kPowerStateCount] =

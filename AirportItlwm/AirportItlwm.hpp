@@ -25,6 +25,7 @@
 #include "ItlIwm.hpp"
 #include "ItlIwx.hpp"
 #include "ItlIwn.hpp"
+#include "Athn.hpp"
 
 #include "AirportItlwmInterface.hpp"
 
@@ -100,7 +101,6 @@ public:
     void setGTK(const u_int8_t *key, size_t key_len, u_int8_t kid, u_int8_t *rsc);
     void watchdogAction(IOTimerEventSource *timer);
     bool initPCIPowerManagment(IOPCIDevice *provider);
-    static IOReturn tsleepHandler(OSObject* owner, void* arg0 = 0, void* arg1 = 0, void* arg2 = 0, void* arg3 = 0);
     static void eventHandler(struct ieee80211com *, int, void *);
     IOReturn enableAdapter(IONetworkInterface *netif);
     void disableAdapter(IONetworkInterface *netif);

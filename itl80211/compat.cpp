@@ -23,7 +23,52 @@
 #include <sys/param.h>
 #include <sys/proc.h>
 
+#include <IOKit/IOCommandGate.h>
+#include <IOKit/IODMACommand.h>
+
 OSDefineMetaClassAndStructors(pci_intr_handle, OSObject)
+
+extern IOCommandGate *_fCommandGate;
+
+IOReturn tsleepHandler(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3) {
+    if (arg1 == 0)
+        return _fCommandGate->commandSleep(arg0, THREAD_INTERRUPTIBLE) == THREAD_AWAKENED ? kIOReturnSuccess : kIOReturnTimeout;
+    else {
+        AbsoluteTime deadline;
+        clock_interval_to_deadline(((int)(uint64_t)arg1), kNanosecondScale, reinterpret_cast<uint64_t*> (&deadline));
+        return _fCommandGate->commandSleep(arg0, deadline, THREAD_INTERRUPTIBLE) == THREAD_AWAKENED ? kIOReturnSuccess : kIOReturnTimeout;
+    }
+}
+
+int
+tsleep_nsec(void *ident, int priority, const char *wmesg, int timo)
+{
+    if (!_fCommandGate) {
+        IOLog("%s No command gate for sleep\n", __FUNCTION__);
+        return 0;
+    }
+    return _fCommandGate->runAction(tsleepHandler, ident, (void *)(uint64_t)timo);
+}
+
+void
+wakeupOn(void *ident)
+{
+    if (!_fCommandGate) {
+        IOLog("%s No command gate for wakeup\n", __FUNCTION__);
+        return;
+    }
+    _fCommandGate->commandWakeup(ident);
+}
+
+void
+wakeup_oneOn(void *ident)
+{
+    if (!_fCommandGate) {
+        IOLog("%s No command gate for wakeup one thread\n", __FUNCTION__);
+        return;
+    }
+    _fCommandGate->commandWakeup(ident, true);
+}
 
 int pci_get_capability(pci_chipset_tag_t chipsettag, pcitag_t pcitag, int capid, int *offsetp, pcireg_t *valuep) {
 	uint8_t offset;
@@ -69,6 +114,11 @@ int pci_mapreg_map(const struct pci_attach_args *pa, int reg, pcireg_t type, int
 	return 0;
 }
 
+int bus_space_unmap(bus_space_tag_t tag, bus_space_handle_t handle, bus_size_t size)
+{
+    return 0;
+}
+
 int
 pci_intr_map_msix(struct pci_attach_args *pa, int vec, pci_intr_handle_t *ihp)
 {
@@ -87,7 +137,39 @@ pci_intr_map_msix(struct pci_attach_args *pa, int vec, pci_intr_handle_t *ihp)
     return pci_intr_map_msi(pa, ihp);
 }
 
-int pci_intr_map_msi(struct pci_attach_args *paa, pci_intr_handle_t *ih) {
+#define  PCI_MSI_FLAGS        2    /* Message Control */
+#define  PCI_CAP_ID_MSI        0x05    /* Message Signalled Interrupts */
+#define  PCI_MSIX_FLAGS        2    /* Message Control */
+#define  PCI_CAP_ID_MSIX    0x11    /* MSI-X */
+#define  PCI_MSIX_FLAGS_ENABLE    0x8000    /* MSI-X enable */
+#define  PCI_MSI_FLAGS_ENABLE    0x0001    /* MSI feature enabled */
+
+static void pciMsiSetEnable(IOPCIDevice *device, UInt8 msiCap, int enable)
+{
+    u16 control;
+    
+    control = device->configRead16(msiCap + PCI_MSI_FLAGS);
+    control &= ~PCI_MSI_FLAGS_ENABLE;
+    if (enable)
+        control |= PCI_MSI_FLAGS_ENABLE;
+    device->configWrite16(msiCap + PCI_MSI_FLAGS, control);
+}
+
+static void pciMsiXClearAndSet(IOPCIDevice *device, UInt8 msixCap, UInt16 clear, UInt16 set)
+{
+    u16 ctrl;
+    
+    ctrl = device->configRead16(msixCap + PCI_MSIX_FLAGS);
+    ctrl &= ~clear;
+    ctrl |= set;
+    device->configWrite16(msixCap + PCI_MSIX_FLAGS, ctrl);
+}
+
+int pci_intr_map_msi(struct pci_attach_args *paa, pci_intr_handle_t *ih)
+{
+    UInt8 msiCap;
+    UInt8 msixCap;
+
 	if (paa == 0 || ih == 0)
 		return 1;
 	
@@ -99,50 +181,106 @@ int pci_intr_map_msi(struct pci_attach_args *paa, pci_intr_handle_t *ih) {
 	(*ih)->dev = paa->pa_tag;  // pci device reference
 	
 	(*ih)->workloop = paa->workloop;
+    
+    (*ih)->msi = true;
+    
+    paa->pa_tag->findPCICapability(PCI_CAP_ID_MSIX, &msixCap);
+    if (msixCap) {
+        pciMsiXClearAndSet(paa->pa_tag, msixCap, PCI_MSIX_FLAGS_ENABLE, 0);
+    }
+    paa->pa_tag->findPCICapability(PCI_CAP_ID_MSI, &msiCap);
+    if (msiCap) {
+        pciMsiSetEnable(paa->pa_tag, msiCap, 1);
+    }
 	
 	return 0; // XXX not required on OS X
 }
 
-int pci_intr_map(struct pci_attach_args *paa, pci_intr_handle_t *ih) {
-	return pci_intr_map_msi(paa, ih);
+int pci_intr_map(struct pci_attach_args *paa, pci_intr_handle_t *ih)
+{
+    UInt8 msiCap;
+    UInt8 msixCap;
+
+    if (paa == 0 || ih == 0)
+        return 1;
+    
+    *ih = new pci_intr_handle();
+    
+    if (*ih == 0)
+        return 1;
+    
+    (*ih)->dev = paa->pa_tag;  // pci device reference
+    
+    (*ih)->workloop = paa->workloop;
+    
+    (*ih)->msi = false;
+    
+    paa->pa_tag->findPCICapability(PCI_CAP_ID_MSIX, &msixCap);
+    if (msixCap) {
+        pciMsiXClearAndSet(paa->pa_tag, msixCap, PCI_MSIX_FLAGS_ENABLE, 0);
+    }
+    paa->pa_tag->findPCICapability(PCI_CAP_ID_MSI, &msiCap);
+    if (msiCap) {
+        pciMsiSetEnable(paa->pa_tag, msiCap, 0);
+    }
+
+	return 0;
 }
 
-void interruptTrampoline(OSObject *ih, IOInterruptEventSource *, int count);
-void interruptTrampoline(OSObject *ih, IOInterruptEventSource *, int count) {
-	pci_intr_handle* _ih = OSDynamicCast(pci_intr_handle, ih);
-	if (_ih == 0)
-		return;
-	_ih->func(_ih->arg); // jump to actual interrupt handler
+static void interruptTrampoline(OSObject *object, IOInterruptEventSource *sender, int count)
+{
+    pci_intr_handle *ih = OSDynamicCast(pci_intr_handle, object);
+    if (!ih || !ih->func)
+        return;
+    ih->func(ih->arg);
 }
 
-void* pci_intr_establish(pci_chipset_tag_t pc, pci_intr_handle_t ih, int level, int (*handler)(void *), void *arg) {
+void* pci_intr_establish(pci_chipset_tag_t pc, pci_intr_handle_t ih, int level, int (*handler)(void *), void *arg, const char *name)
+{
+    int intrIndex = 0;
+
+    if (ih->msi) {
+        for (int index = 0; ; index++)
+        {
+            int interruptType;
+            int ret = ih->dev->getInterruptType(index, &interruptType);
+            if (ret != kIOReturnSuccess)
+                break;
+            if (interruptType & kIOInterruptTypePCIMessaged)
+            {
+                intrIndex = index;
+                break;
+            }
+        }
+    }
 	ih->arg = arg;
-	ih->intr = IOInterruptEventSource::interruptEventSource(ih, &interruptTrampoline, ih->dev);
+    ih->func = handler;
+	ih->intr = IOInterruptEventSource::interruptEventSource(ih, &interruptTrampoline, ih->dev, intrIndex);
 	
-	if (ih->intr == 0)
-		return 0;
+	if (ih->intr == NULL)
+		return NULL;
 	if (ih->workloop->addEventSource(ih->intr) != kIOReturnSuccess)
-		return 0;
+		return NULL;
 	
 	ih->intr->enable();
 	return ih;
 }
 
-void pci_intr_disestablish(pci_chipset_tag_t pc, void *ih) {
+void pci_intr_disestablish(pci_chipset_tag_t pc, void *ih)
+{
 	pci_intr_handle_t intr = (pci_intr_handle_t) ih;
+    
+	if (intr->workloop)
+        intr->workloop->removeEventSource(intr->intr);
 	
-	intr->workloop->removeEventSource(intr->intr);
+    if (intr->intr) {
+        intr->intr->release();
+        intr->intr = NULL;
+    }
+	intr->dev = NULL;
+	intr->workloop = NULL;
 	
-	intr->intr->release();
-	intr->intr = 0;
-	
-	intr->dev->release();
-	intr->dev = 0;
-	
-	intr->workloop->release();
-	intr->workloop = 0;
-	
-	intr->arg = 0;
+	intr->arg = NULL;
 	intr->release();
 	intr = 0;
 	ih = 0;
@@ -174,128 +312,171 @@ void bus_space_barrier(bus_space_tag_t space, bus_space_handle_t handle, bus_siz
 
 int bus_dmamap_create(bus_dma_tag_t tag, bus_size_t size, int nsegments, bus_size_t maxsegsz, bus_size_t boundary, int flags, bus_dmamap_t *dmamp) {
 	if (dmamp == 0)
-		return 1;
+		return -EINVAL;
 	*dmamp = new bus_dmamap;
 	(*dmamp)->cursor = IOMbufNaturalMemoryCursor::withSpecification(maxsegsz, nsegments);
-	if ((*dmamp)->cursor == 0)
-		return 1;
-	else
-		return 0;
+    (*dmamp)->dm_maxsegs = nsegments;
+    (*dmamp)->dm_mapsize = size;
+    return (*dmamp)->cursor == NULL;
 }
 
-IOBufferMemoryDescriptor* alloc_dma_memory(size_t size, mach_vm_address_t alignment,/* void** vaddr, mach_vm_address_t* paddr, */IOOptionBits opts);
-IOBufferMemoryDescriptor* alloc_dma_memory(size_t size, mach_vm_address_t alignment,/* void** vaddr, mach_vm_address_t* paddr, */IOOptionBits opts = kIOMemoryPhysicallyContiguous | kIOMapInhibitCache)
+int bus_dmamem_alloc(bus_dma_tag_t tag, bus_size_t size, bus_size_t alignment, bus_size_t boundary, bus_dma_segment_t *segs, int nsegs, int *rsegs, int flags)
 {
-	size_t		reqsize;
-	uint64_t	phymask;
-	int		i;
-	/*
-	if (alignment <= PAGE_SIZE) {
-		reqsize = size;
-		phymask = 0x00000000ffffffffull & (~(alignment - 1));
-	} else {
-		reqsize = size + alignment;
-		phymask = 0x00000000fffff000ull; /* page-aligned 
-	}*/
-	
-	phymask = 0x00000000ffffffffull & (~(alignment - 1));
-	reqsize = size;
-	
-	IOBufferMemoryDescriptor* mem = 0;
-	mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, opts, reqsize, phymask);
-	if (!mem)
-		return 0;
+    UInt64 ofs = 0;
+    UInt32 numSegs = 1;
+    IODMACommand::Segment64 seg;
 
-	mem->prepare();
-	/*
-	if (paddr)
-		*paddr = mem->getPhysicalAddress();
-	if (vaddr)
-		*vaddr = mem->getBytesNoCopy();
-	
-	/*
-	 * Check the alignment and increment by 4096 until we get the
-	 * requested alignment. Fail if can't obtain the alignment
-	 * we requested.
-	 
-	if ((*paddr & (alignment - 1)) != 0) {
-		for (i = 0; i < alignment / 4096; i++) {
-			if ((*paddr & (alignment - 1 )) == 0)
-				break;
-			*paddr += 4096;
-			*vaddr = ((uint8_t*) *vaddr) + 4096;
-		}
-		if (i == alignment / 4096) {
-			mem->complete();
-			mem->release();
-			return 0;
-		}
-	}*/
-	return mem;
+    segs->bmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapInhibitCache, size, DMA_BIT_MASK(36));
+    if (segs->bmd == NULL) {
+        XYLog("%s alloc DMA memory failed.\n", __FUNCTION__);
+        return -ENOMEM;
+    }
+    segs->bmd->prepare();
+    segs->cmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, alignment);
+    if (segs->cmd == NULL) {
+        XYLog("%s alloc IODMACommand memory failed.\n", __FUNCTION__);
+        segs->bmd->complete();
+        segs->bmd->release();
+        segs->bmd = NULL;
+        return -ENOMEM;
+    }
+    segs->cmd->setMemoryDescriptor(segs->bmd);
+    if (segs->cmd->gen64IOVMSegments(&ofs, &seg, &numSegs) != kIOReturnSuccess) {
+        segs->cmd->release();
+        segs->cmd = NULL;
+        segs->bmd->complete();
+        segs->bmd->release();
+        segs->bmd = NULL;
+        return -ENOMEM;
+    }
+    segs->paddr = seg.fIOVMAddr;
+    segs->vaddr = segs->bmd->getBytesNoCopy();
+    segs->size = size;
+    memset(segs->vaddr, 0, segs->size);
+    *rsegs = numSegs;
+    return 0;
 }
 
-
-int bus_dmamem_alloc(bus_dma_tag_t tag, bus_size_t size, bus_size_t alignment, bus_size_t boundary, bus_dma_segment_t *segs, int nsegs, int *rsegs, int flags) {
-	// Ignore flags and don't pass in the number of segments, it's not used in the driver (always 1 anyway)
-	if (segs == 0)
-		return 1;
-	*segs = alloc_dma_memory(size, alignment);
-	if (*segs == 0)
-		return 1;
-	else
-		return 0;
-}
-
-int bus_dmamem_map(bus_dma_tag_t tag, bus_dma_segment_t *segs, int nsegs, size_t size, void **kvap, int flags) {
-	// ignore flags, the memory is already mapped as one segment by the call to bus_dmamem_alloc so just return the virtual address
-	if (*segs == 0 || kvap == 0)
-		return 1;
-	*kvap = (*segs)->getBytesNoCopy();
+int bus_dmamem_map(bus_dma_tag_t tag, bus_dma_segment_t *segs, int nsegs, size_t size, caddr_t *kvap, int flags)
+{
+    if (!kvap)
+        return -EINVAL;
+    memset(segs->vaddr, 0, segs->size);
+    *kvap = (caddr_t)segs->vaddr;
 	return 0;
 }
 
-bus_addr_t bus_dmamap_get_paddr(bus_dma_segment_t seg) {
-	if (seg == 0)
-		return 0;
-	else
-		return seg->getPhysicalAddress();
+void bus_dmamap_sync(bus_dma_tag_t tag, bus_dmamap_t dmam, bus_addr_t offset, bus_size_t len, int ops)
+{
 }
 
-void bus_dmamap_sync(bus_dma_tag_t tag, bus_dmamap_t dmam, bus_addr_t offset, bus_size_t len, int ops) {
-	return; // no syncing, we mapped the memory with cache inhibition so pray it works
+int bus_dmamap_unload(bus_dma_tag_t tag, bus_dmamap_t dmam)
+{
+    if (dmam->_loadCmd)
+        dmam->_loadCmd->clearMemoryDescriptor();
+    if (dmam->_loadDesc) {
+        dmam->_loadDesc->complete();
+        dmam->_loadDesc->release();
+        dmam->_loadDesc = NULL;
+    }
+    return 0;
 }
 
-void bus_dmamem_unmap(bus_dma_segment_t seg) {
-	if (seg == 0)
-		return;
-	seg->complete();
+int bus_dmamem_unmap(bus_dma_tag_t tag, void *addr, int length)
+{
+    return 0;
 }
 
-void bus_dmamem_free(bus_dma_tag_t tag, bus_dma_segment_t *segs, int nsegs) {
-	if (segs == 0)
-		return;
-	if (*segs == 0)
-		return;
-	(*segs)->release();
-	*segs = 0;
+void bus_dmamem_unmap(bus_dma_segment_t seg)
+{
+}
+
+void bus_dmamem_free(bus_dma_tag_t tag, bus_dma_segment_t *dma, int nsegs)
+{
+	if (dma == NULL)
+        return;
+    if (dma->vaddr == NULL)
+        return;
+    if (dma->cmd) {
+        dma->cmd->clearMemoryDescriptor();
+        dma->cmd->release();
+        dma->cmd = NULL;
+    }
+    if (dma->bmd) {
+        dma->bmd->complete();
+        dma->bmd->release();
+        dma->bmd = NULL;
+    }
+    dma->vaddr = NULL;
 }
 
 void bus_dmamap_destroy(bus_dma_tag_t tag, bus_dmamap_t dmam) {
-	if (dmam == 0)
+	if (dmam == NULL)
 		return;
-	if (dmam->cursor == 0)
+    if (dmam->_loadCmd) {
+        dmam->_loadCmd->release();
+        dmam->_loadCmd = NULL;
+    }
+    if (dmam->_loadDesc) {
+        dmam->_loadDesc->release();
+        dmam->_loadDesc = NULL;
+    }
+	if (dmam->cursor == NULL)
 		return;
 	dmam->cursor->release();
-	dmam->cursor = 0;
+	dmam->cursor = NULL;
 	delete dmam;
 }
 
-int bus_dmamap_load(bus_dmamap_t map, mbuf_t mb) {
-	if (map == 0 || mb == 0)
-		return 1;
-	map->dm_nsegs = map->cursor->getPhysicalSegmentsWithCoalesce(mb, map->dm_segs, 1);
-	if (map->dm_nsegs == 0)
-		return 1;
-	else
-		return 0;
+int bus_dmamap_load_mbuf(bus_dma_tag_t tag, bus_dmamap_t dmam, mbuf_t m, int ops)
+{
+    if (dmam == NULL || m == NULL)
+        return -EINVAL;
+    if (ops & BUS_DMA_WRITE)
+        dmam->dm_nsegs = dmam->cursor->getPhysicalSegmentsWithCoalesce(m, &dmam->dm_segs[0], dmam->dm_maxsegs);
+    else
+        dmam->dm_nsegs = dmam->cursor->getPhysicalSegments(m, &dmam->dm_segs[0], 1);
+    return dmam->dm_nsegs == 0;
+}
+
+int bus_dmamap_load_raw(bus_dma_tag_t t, bus_dmamap_t map, bus_dma_segment_t *segs, int nsegs, bus_size_t size, int flags)
+{
+    if (map == NULL)
+        return -EINVAL;
+    map->dm_segs[0].location = segs->paddr;
+    map->dm_segs[0].length = segs->size;
+    return 0;
+}
+
+int bus_dmamap_load(bus_dma_tag_t tag, bus_dmamap_t dmam, void *addr, int size, struct proc *p, int ops)
+{
+    UInt64 ofs = 0;
+    UInt32 numSegs = 1;
+    if (dmam == NULL)
+        return -EINVAL;
+    dmam->_loadDesc = IOBufferMemoryDescriptor::withAddress(addr, size, kIODirectionInOut);
+    if (dmam->_loadDesc == NULL) {
+        XYLog("%s alloc DMA memory failed.\n", __FUNCTION__);
+        return -ENOMEM;
+    }
+    dmam->_loadDesc->prepare();
+    dmam->_loadCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1);
+    if (dmam->_loadCmd == NULL) {
+        XYLog("%s alloc IODMACommand memory failed.\n", __FUNCTION__);
+        dmam->_loadDesc->complete();
+        dmam->_loadDesc->release();
+        dmam->_loadDesc = NULL;
+        return -ENOMEM;
+    }
+    dmam->_loadCmd->setMemoryDescriptor(dmam->_loadDesc);
+    if (dmam->_loadCmd->genIOVMSegments(&ofs, &dmam->dm_segs[0], &numSegs) != kIOReturnSuccess) {
+        dmam->_loadCmd->release();
+        dmam->_loadCmd = NULL;
+        dmam->_loadDesc->complete();
+        dmam->_loadDesc->release();
+        dmam->_loadDesc = NULL;
+        return -ENOMEM;
+    }
+    dmam->dm_nsegs = numSegs;
+    return 0;
 }
