@@ -123,11 +123,6 @@ bool itlwm::createMediumTables(const IONetworkMedium **primary)
     return result;
 }
 
-ieee80211_wpaparams wpa;
-ieee80211_wpapsk psk;
-ieee80211_nwkey nwkey;
-ieee80211_join join;
-
 void itlwm::joinSSID(const char *ssid_name, const char *ssid_pwd)
 {
     struct ieee80211com *ic = fHalService->get80211Controller();
@@ -166,8 +161,6 @@ void itlwm::joinSSID(const char *ssid_name, const char *ssid_pwd)
     if (ieee80211_add_ess(ic, &join) == 0)
         ic->ic_flags |= IEEE80211_F_AUTO_JOIN;
 }
-
-struct ieee80211_nwid nwid;
 
 void itlwm::associateSSID(const char *ssid, const char *pwd)
 {
@@ -511,7 +504,7 @@ setLinkStatus(UInt32 status, const IONetworkMedium * activeMedium, UInt64 speed,
 #ifdef __PRIVATE_SPI__
             fNetIf->startOutputThread();
 #endif
-            ifq_clr_oactive(&ifq->if_snd);
+
         } else if (!(status & kIONetworkLinkNoNetworkChange)) {
 #ifdef __PRIVATE_SPI__
             fNetIf->stopOutputThread();
@@ -519,7 +512,7 @@ setLinkStatus(UInt32 status, const IONetworkMedium * activeMedium, UInt64 speed,
 #endif
             ifq_flush(&ifq->if_snd);
             mq_purge(&fHalService->get80211Controller()->ic_mgtq);
-            ifq_set_oactive(&ifq->if_snd);
+
         }
     }
     return ret;
@@ -550,16 +543,13 @@ IOReturn itlwm::setHardwareAddress(const IOEthernetAddress *addrP)
 #ifdef __PRIVATE_SPI__
 IOReturn itlwm::outputStart(IONetworkInterface *interface, IOOptionBits options)
 {
-    _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
+    struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     mbuf_t m = NULL;
-    if (ifq_is_oactive(&ifp->if_snd)) {
+
         return kIOReturnNoResources;
-    }
     while (kIOReturnSuccess == interface->dequeueOutputPackets(1, &m)) {
-        outputPacket(m, NULL);
-        if (ifq_is_oactive(&ifp->if_snd)) {
+
             return kIOReturnNoResources;
-        }
     }
     return kIOReturnSuccess;
 }

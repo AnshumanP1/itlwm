@@ -1078,8 +1078,7 @@ ieee80211_delba_request(struct ieee80211com *ic, struct ieee80211_node *ni,
 			for (i = 0; i < IEEE80211_BA_MAX_WINSZ; i++)
 				mbuf_freem(ba->ba_buf[i].m);
 			/* free reordering buffer */
-			IOFree(ba->ba_buf,
-			    IEEE80211_BA_MAX_WINSZ * sizeof(*ba->ba_buf));
+			free(ba->ba_buf);
 			ba->ba_buf = NULL;
 		}
 	}
@@ -1624,7 +1623,6 @@ ieee80211_set_link_state(struct ieee80211com *ic, int nstate)
 {
 	struct _ifnet *ifp = &ic->ic_if;
     int link_state;
-    XYLog("%s nstate=%d, old_state=%d\n", __FUNCTION__, nstate, ifp->if_link_state);
     
 	switch (ic->ic_opmode) {
 #ifndef IEEE80211_STA_ONLY

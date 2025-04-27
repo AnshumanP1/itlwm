@@ -224,7 +224,6 @@ ieee80211_ifattach(struct _ifnet *ifp, IOEthernetController *controller)
     ifq_init(&ifp->if_snd, ifp, 2048);
     memcpy(((struct arpcom *)ifp)->ac_enaddr, ic->ic_myaddr,
            ETHER_ADDR_LEN);
-    //	ether_ifattach(ifp);
     if (ifp->if_sadl) {
         ::free(ifp->if_sadl);
     }
@@ -287,7 +286,6 @@ ieee80211_ifdetach(struct _ifnet *ifp)
     ifp->netStat = NULL;
     ifp->controller = NULL;
     ifp->iface = NULL;
-    //	ether_ifdetach(ifp);
 }
 
 /*
