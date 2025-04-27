@@ -278,6 +278,19 @@ ieee80211_ra_get_rateset(struct ieee80211_ra_node *ra, struct ieee80211com *ic, 
     panic("%s mcs=%d rs_count=%d sgi=%d nss=%d bw=%d rate==NULL!!!!\n", __FUNCTION__, mcs, ra->active_rs_count, ra->sgi, ra->nss, ra->bw);
 }
 
+int
+ieee80211_ra_use_ht_sgi(struct ieee80211_node *ni)
+{
+    if ((ni->ni_chw == IEEE80211_CHAN_WIDTH_40) &&
+        ieee80211_node_supports_ht_chan40(ni)) {
+        if (ni->ni_flags & IEEE80211_NODE_HT_SGI40)
+            return 1;
+    } else if (ni->ni_flags & IEEE80211_NODE_HT_SGI20)
+        return 1;
+    
+    return 0;
+}
+
 /*
  * Update goodput statistics.
  */
@@ -370,8 +383,6 @@ ieee80211_ra_next_rateset(struct ieee80211_ra_node *rn, struct ieee80211com *ic,
                 continue;
             if (rsnext->nss > support_nss(ni))
                 continue;
-            if (rsnext->sgi && !ieee80211_node_supports_sgi(ni))
-                continue;
             found = true;
             break;
         }
@@ -384,8 +395,6 @@ ieee80211_ra_next_rateset(struct ieee80211_ra_node *rn, struct ieee80211com *ic,
             if (rsnext->band_width > ni->ni_chw)
                 continue;
             if (rsnext->nss > support_nss(ni))
-                continue;
-            if (rsnext->sgi && !ieee80211_node_supports_sgi(ni))
                 continue;
             found = true;
             break;
@@ -744,7 +753,7 @@ ieee80211_ra_add_stats_ht(struct ieee80211_ra_node *rn,
     static const uint64_t alpha = RA_FP_1 / 8; /* 1/8 = 0.125 */
     static const uint64_t beta =  RA_FP_1 / 4; /* 1/4 = 0.25 */
     int s;
-    struct ieee80211_ra_goodput_stats *g = &rn->g[mcs];
+    struct ieee80211_ra_goodput_stats *g;
     uint64_t sfer, rate, delta;
 
     /*
@@ -758,6 +767,7 @@ ieee80211_ra_add_stats_ht(struct ieee80211_ra_node *rn,
 
     s = splnet();
 
+    g = &rn->g[mcs];
     g->nprobe_pkts += total;
     g->nprobe_fail += fail;
 

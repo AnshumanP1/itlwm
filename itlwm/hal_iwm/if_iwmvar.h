@@ -124,6 +124,8 @@
 #include <IOKit/network/IOMbufMemoryCursor.h>
 #include <IOKit/IODMACommand.h>
 
+#include "rs.h"
+
 struct iwm_rx_radiotap_header {
     struct ieee80211_radiotap_header wr_ihdr;
     uint64_t    wr_tsft;
@@ -285,11 +287,9 @@ struct iwm_tx_data {
     int txmcs;
     int txrate;
     int totlen;
-    int data_type;
+    uint16_t fc;
     
-    /* A-MPDU subframes */
-    int ampdu_txmcs;
-    int ampdu_nframes;
+    struct ieee80211_tx_info info;
 };
 
 struct iwm_tx_ring {
@@ -489,6 +489,12 @@ struct iwm_rxq_dup_data {
 
 struct iwm_tx_ba {
    struct iwm_node *    wn;
+    uint32_t rate_n_flags;
+    uint8_t lq_color;
+    uint16_t tx_time;
+    uint32_t tx_count_last;
+    uint32_t tx_count;
+    unsigned long tpt_meas_start;
 };
 
 struct iwm_ba_task_data {
@@ -542,6 +548,7 @@ struct iwm_softc {
     int cmdqid;
     
     uint8_t sc_mgmt_last_antenna_idx;
+    uint8_t sc_tx_ant;
 
 	int sc_sf_state;
 
@@ -618,7 +625,7 @@ struct iwm_softc {
 
 	struct iwm_bf_data sc_bf;
 
-	int sc_tx_timer;
+	int sc_tx_timer[IWM_MAX_QUEUES];
 	int sc_rx_ba_sessions;
 
 	int sc_scan_last_antenna;
@@ -655,6 +662,7 @@ struct iwm_softc {
     int sc_ltr_enabled;
     enum iwm_nvm_type nvm_type;
     int support_ldpc;
+    uint8_t non_shared_ant;
     
     int sc_mqrx_supported;
     int sc_integrated;
@@ -687,6 +695,11 @@ struct iwm_softc {
 #define sc_txtap	sc_txtapu.th
 	int			sc_txtap_len;
 #endif
+    union {
+        struct iwl_lq_sta_rs_fw rs_fw;
+        struct iwl_lq_sta rs_drv;
+    } lq_sta;
+    int tx_protection;
 };
 
 struct iwm_node {
@@ -698,7 +711,6 @@ struct iwm_node {
     uint16_t in_color;
 
     struct ieee80211_amrr_node in_amn;
-    struct ieee80211_ra_node in_rn;
     int lq_rate_mismatch;
     uint32_t next_ampdu_id;
     

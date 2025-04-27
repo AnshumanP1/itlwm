@@ -227,6 +227,10 @@ IOReturn ItlIwx::disable(IONetworkInterface *netif)
 {
     XYLog("%s\n", __FUNCTION__);
     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
+    if (!(ifp->if_flags & IFF_UP)) {
+        XYLog("%s already in diactivating state\n", __FUNCTION__);
+        return kIOReturnSuccess;
+    }
     ifp->if_flags &= ~IFF_UP;
     iwx_activate(&com, DVACT_QUIESCE);
     return kIOReturnSuccess;
@@ -4072,10 +4076,6 @@ iwx_setup_he_rates(struct iwx_softc *sc)
             IEEE80211_HE_MAC_CAP5_UL_2x996_TONE_RU |
             IEEE80211_HE_MAC_CAP5_HE_DYNAMIC_SM_PS |
             IEEE80211_HE_MAC_CAP5_HT_VHT_TRIG_FRAME_RX,
-        .phy_cap_info[0] =
-            IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G |
-            IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G |
-            IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G,
         .phy_cap_info[1] =
             IEEE80211_HE_PHY_CAP1_PREAMBLE_PUNC_RX_MASK |
             IEEE80211_HE_PHY_CAP1_DEVICE_CLASS_A |
@@ -4452,6 +4452,9 @@ iwx_ampdu_rx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
         tid >= IWX_MAX_TID_COUNT)
         return ENOSPC;
     
+    if (ic->ic_state != IEEE80211_S_RUN)
+        return ENOSPC;
+    
     if (sc->ba_rx.start_tidmask & (1 << tid))
         return EBUSY;
 
@@ -4475,6 +4478,9 @@ iwx_ampdu_rx_stop(struct ieee80211com *ic, struct ieee80211_node *ni,
     if (tid >= IWX_MAX_TID_COUNT || sc->ba_rx.stop_tidmask & (1 << tid))
         return;
     
+    if (ic->ic_state != IEEE80211_S_RUN)
+        return;
+
     sc->ba_rx.stop_tidmask |= (1 << tid);
     that->iwx_add_task(sc, systq, &sc->ba_task);
 }
@@ -8636,7 +8642,7 @@ iwx_scan_abort(struct iwx_softc *sc)
 }
 
 int ItlIwx::
-iwx_enable_data_tx_queues(struct iwx_softc *sc)
+iwx_enable_mgmt_queue(struct iwx_softc *sc)
 {
     int err;
     int cmdver;
@@ -8728,7 +8734,7 @@ iwx_rs_fw_get_config_flags(struct iwx_softc *sc)
     }
     
     if (iwx_num_of_ant(iwx_fw_valid_tx_ant(sc)) > 1) {
-        if (ic->ic_flags & IEEE80211_F_HEON &&
+        if ((ni->ni_flags & IEEE80211_NODE_HE) &&
             ni->ni_he_cap_elem.phy_cap_info[2] &
             IEEE80211_HE_PHY_CAP2_STBC_RX_UNDER_80MHZ) {
             flags |= IWX_TLC_MNG_CFG_FLAGS_STBC_MSK;
@@ -8743,17 +8749,17 @@ iwx_rs_fw_get_config_flags(struct iwx_softc *sc)
         flags |= IWX_TLC_MNG_CFG_FLAGS_LDPC_MSK;
     
     /* consider LDPC support in case of HE */
-    if ((ic->ic_flags & IEEE80211_F_HEON) && 
+    if ((ni->ni_flags & IEEE80211_NODE_HE) &&
         (ni->ni_he_cap_elem.phy_cap_info[1] &
         IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD))
         flags |= IWX_TLC_MNG_CFG_FLAGS_LDPC_MSK;
     
-    if ((ic->ic_flags & IEEE80211_F_HEON) &&
+    if ((ni->ni_flags & IEEE80211_NODE_HE) &&
         !(ni->ni_he_cap_elem.phy_cap_info[1] &
          IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD))
         flags &= ~IWX_TLC_MNG_CFG_FLAGS_LDPC_MSK;
 
-    if ((ic->ic_flags & IEEE80211_F_HEON) &&
+    if ((ni->ni_flags & IEEE80211_NODE_HE) &&
         (ni->ni_he_cap_elem.phy_cap_info[3] &
          IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_RX_MASK))
         flags |= IWX_TLC_MNG_CFG_FLAGS_HE_DCM_NSS_1_MSK;
@@ -9213,7 +9219,7 @@ iwx_auth(struct iwx_softc *sc)
         return 0;
     }
     
-    err = iwx_enable_data_tx_queues(sc);
+    err = iwx_enable_mgmt_queue(sc);
     if (err)
         goto rm_sta;
     
@@ -11752,6 +11758,7 @@ static const struct pci_matchid iwx_devices[] = {
     {IWL_PCI_DEVICE(0x7A70, PCI_ANY_ID, iwl_so_long_latency_trans_cfg)},
     {IWL_PCI_DEVICE(0x7AF0, PCI_ANY_ID, iwl_so_trans_cfg)},
     {IWL_PCI_DEVICE(0x51F0, PCI_ANY_ID, iwl_so_long_latency_trans_cfg)},
+    {IWL_PCI_DEVICE(0x51F1, PCI_ANY_ID, iwl_so_long_latency_trans_cfg)},
     {IWL_PCI_DEVICE(0x54F0, PCI_ANY_ID, iwl_so_long_latency_trans_cfg)},
     {IWL_PCI_DEVICE(0x7F70, PCI_ANY_ID, iwl_so_trans_cfg)},
     
@@ -12122,6 +12129,15 @@ static const struct iwl_dev_info iwl_dev_info_table[] = {
     IWL_DEV_INFO(0x2723, IWL_CFG_ANY, iwl_ax200_cfg_cc, iwl_ax200_name),
     IWL_DEV_INFO(0x2723, 0x1653, iwl_ax200_cfg_cc, iwl_ax200_killer_1650w_name),
     IWL_DEV_INFO(0x2723, 0x1654, iwl_ax200_cfg_cc, iwl_ax200_killer_1650x_name),
+    IWL_DEV_INFO(0x51F0, 0x1691, iwlax411_2ax_cfg_so_gf4_a0, iwl_ax411_killer_1690s_name),
+    IWL_DEV_INFO(0x51F0, 0x1692, iwlax411_2ax_cfg_so_gf4_a0, iwl_ax411_killer_1690i_name),
+    IWL_DEV_INFO(0x51F1, 0x1692, iwlax411_2ax_cfg_so_gf4_a0, iwl_ax411_killer_1690i_name),
+    IWL_DEV_INFO(0x54F0, 0x1691, iwlax411_2ax_cfg_so_gf4_a0, iwl_ax411_killer_1690s_name),
+    IWL_DEV_INFO(0x54F0, 0x1692, iwlax411_2ax_cfg_so_gf4_a0, iwl_ax411_killer_1690i_name),
+    IWL_DEV_INFO(0x7A70, 0x1691, iwlax411_2ax_cfg_so_gf4_a0, iwl_ax411_killer_1690s_name),
+    IWL_DEV_INFO(0x7A70, 0x1692, iwlax411_2ax_cfg_so_gf4_a0, iwl_ax411_killer_1690i_name),
+    IWL_DEV_INFO(0x7AF0, 0x1691, iwlax411_2ax_cfg_so_gf4_a0, iwl_ax411_killer_1690s_name),
+    IWL_DEV_INFO(0x7AF0, 0x1692, iwlax411_2ax_cfg_so_gf4_a0, iwl_ax411_killer_1690i_name),
     
     /* Qu with Hr */
     IWL_DEV_INFO(0x43F0, 0x0070, iwl_ax201_cfg_qu_hr, NULL),
@@ -12565,7 +12581,7 @@ static const struct iwl_dev_info iwl_dev_info_table[] = {
     _IWL_DEV_INFO(IWL_CFG_ANY, IWL_CFG_ANY,
                   IWL_CFG_MAC_TYPE_SO, IWL_CFG_ANY,
                   IWL_CFG_RF_TYPE_HR1, IWL_CFG_ANY,
-                  IWL_CFG_160, IWL_CFG_ANY, IWL_CFG_NO_CDB,
+                  IWL_CFG_NO_160, IWL_CFG_ANY, IWL_CFG_NO_CDB,
                   iwl_cfg_so_a0_hr_a0, iwl_ax101_name),
     _IWL_DEV_INFO(IWL_CFG_ANY, IWL_CFG_ANY,
                   IWL_CFG_MAC_TYPE_SO, IWL_CFG_ANY,
@@ -12582,7 +12598,7 @@ static const struct iwl_dev_info iwl_dev_info_table[] = {
     _IWL_DEV_INFO(IWL_CFG_ANY, IWL_CFG_ANY,
                   IWL_CFG_MAC_TYPE_SOF, IWL_CFG_ANY,
                   IWL_CFG_RF_TYPE_HR1, IWL_CFG_ANY,
-                  IWL_CFG_160, IWL_CFG_ANY, IWL_CFG_NO_CDB,
+                  IWL_CFG_NO_160, IWL_CFG_ANY, IWL_CFG_NO_CDB,
                   iwl_cfg_so_a0_hr_a0, iwl_ax101_name),
     _IWL_DEV_INFO(IWL_CFG_ANY, IWL_CFG_ANY,
                   IWL_CFG_MAC_TYPE_SOF, IWL_CFG_ANY,
@@ -12776,7 +12792,6 @@ intrFilter(OSObject *object, IOFilterInterruptEventSource *src)
 bool ItlIwx::
 iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
 {
-    pci_intr_handle_t ih;
     pcireg_t reg, memtype;
     struct ieee80211com *ic = &sc->sc_ic;
     struct _ifnet *ifp = &ic->ic_if;
@@ -12835,7 +12850,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
             PCI_COMMAND_STATUS_REG, reg);
     }
     
-    int msiIntrIndex = 0;
+    int msiIntrIndex = -1;
     for (int index = 0; ; index++)
     {
         int interruptType;
@@ -12848,6 +12863,11 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
             break;
         }
     }
+    if (msiIntrIndex == -1) {
+        XYLog("%s: can't find MSI interrupt controller\n", DEVNAME(sc));
+        return false;
+    }
+
     if (sc->sc_msix)
         sc->sc_ih =
         IOFilterInterruptEventSource::filterInterruptEventSource(this,
@@ -12859,7 +12879,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
                                                                              (IOInterruptEventSource::Action)&ItlIwx::iwx_intr, &ItlIwx::intrFilter
                                                                              ,pa->pa_tag, msiIntrIndex);
     if (sc->sc_ih == NULL || pa->workloop->addEventSource(sc->sc_ih) != kIOReturnSuccess) {
-        XYLog("%s: can't establish interrupt", DEVNAME(sc));
+        XYLog("%s: can't establish interrupt\n", DEVNAME(sc));
         return false;
     }
     sc->sc_ih->enable();

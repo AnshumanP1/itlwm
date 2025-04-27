@@ -166,6 +166,10 @@ IOReturn ItlIwn::disable(IONetworkInterface *netif)
 {
     XYLog("%s\n", __FUNCTION__);
     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
+    if (!(ifp->if_flags & IFF_UP)) {
+        XYLog("%s already in diactivating state\n", __FUNCTION__);
+        return kIOReturnSuccess;
+    }
     ifp->if_flags &= ~IFF_UP;
     iwn_activate(&com, DVACT_QUIESCE);
     return kIOReturnSuccess;
@@ -343,8 +347,6 @@ iwn_attach(struct iwn_softc *sc, struct pci_attach_args *pa)
 {
     struct ieee80211com *ic = &sc->sc_ic;
     struct _ifnet *ifp = &ic->ic_if;
-    const char *intrstr;
-    pci_intr_handle_t ih;
     pcireg_t memtype, reg;
     int i, error;
 
@@ -391,7 +393,7 @@ iwn_attach(struct iwn_softc *sc, struct pci_attach_args *pa)
         return false;
     }
 
-    int msiIntrIndex = 0;
+    int msiIntrIndex = -1;
     for (int index = 0; ; index++)
     {
         int interruptType;
@@ -404,12 +406,16 @@ iwn_attach(struct iwn_softc *sc, struct pci_attach_args *pa)
             break;
         }
     }
+    if (msiIntrIndex == -1) {
+        XYLog("%s: can't find MSI interrupt controller\n", DEVNAME(sc));
+        return false;
+    }
 
     sc->sc_ih = IOFilterInterruptEventSource::filterInterruptEventSource(this,
                                                                          (IOInterruptEventSource::Action)&ItlIwn::iwn_intr, &ItlIwn::intrFilter
                                                                          ,pa->pa_tag, msiIntrIndex);
     if (sc->sc_ih == NULL || pa->workloop->addEventSource(sc->sc_ih) != kIOReturnSuccess) {
-        XYLog("%s: can't establish interrupt", DEVNAME(sc));
+        XYLog("%s: can't establish interrupt\n", DEVNAME(sc));
         return false;
     }
     sc->sc_ih->enable();
@@ -544,12 +550,12 @@ iwn_attach(struct iwn_softc *sc, struct pci_attach_args *pa)
             ieee80211_std_rateset_11a;
     }
     if (sc->sc_flags & IWN_FLAG_HAS_11N) {
-        int ntxstreams = sc->ntxchains;
-        int nrxstreams = sc->nrxchains;
-        
         /* Set supported HT rates. */
         if (ic->ic_userflags & IEEE80211_F_NOMIMO)
-            ntxstreams = nrxstreams = 1;
+            sc->ntxchains = sc->nrxchains = 1;
+
+        int ntxstreams = sc->ntxchains;
+        int nrxstreams = sc->nrxchains;
 
         ic->ic_sup_mcs[0] = 0xff;        /* MCS 0-7 */
         if (nrxstreams > 1)
@@ -1749,7 +1755,7 @@ iwn_read_eeprom_enhinfo(struct iwn_softc *sc)
 
     memset(sc->enh_maxpwr, 0, sizeof sc->enh_maxpwr);
     for (i = 0; i < nitems(enhinfo); i++) {
-        if (enhinfo[i].chan == 0 || enhinfo[i].reserved != 0)
+        if ((enhinfo[i].flags & IWN_TXP_VALID) == 0)
             continue;    /* Skip invalid entries. */
 
         maxpwr = 0;
@@ -2204,7 +2210,7 @@ iwn_rx_done(struct iwn_softc *sc, struct iwn_rx_desc *desc,
     }
     ni = ieee80211_find_rxnode(ic, wh);
 
-    rxi.rxi_flags = 0;
+    memset(&rxi, 0, sizeof(rxi));
     if (((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_CTL)
         && (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) &&
         !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
@@ -2293,7 +2299,6 @@ iwn_rx_done(struct iwn_softc *sc, struct iwn_rx_desc *desc,
 
     /* Send the frame to the 802.11 layer. */
     rxi.rxi_rssi = rssi;
-    rxi.rxi_tstamp = 0;    /* unused */
     rxi.rxi_chan = chan;
     ieee80211_inputm(ifp, m, ni, &rxi, ml);
 
@@ -3592,7 +3597,10 @@ iwn_tx(struct iwn_softc *sc, mbuf_t m, struct ieee80211_node *ni)
         }
     }
 
-    if (IEEE80211_IS_MULTICAST(wh->i_addr1) ||
+    if (type == IEEE80211_FC0_TYPE_CTL &&
+        subtype == IEEE80211_FC0_SUBTYPE_BAR)
+        tx->id = wn->id;
+    else if (IEEE80211_IS_MULTICAST(wh->i_addr1) ||
         type != IEEE80211_FC0_TYPE_DATA)
         tx->id = sc->broadcast_id;
     else
@@ -4039,7 +4047,7 @@ iwn_set_link_quality(struct iwn_softc *sc, struct ieee80211_node *ni)
     struct iwn_cmd_link_quality linkq;
     struct ieee80211_rateset *rs = &ni->ni_rates;
     uint8_t txant;
-    int i, ridx, ridx_min, ridx_max, j, sgi_ok = 0, is_40mhz = 0, mimo, tab = 0, rflags = 0;
+    int i, ridx, ridx_min, ridx_max, j, mimo, tab = 0, rflags = 0;
 
     /* Use the first valid TX antenna. */
     txant = IWN_LSB(sc->txchainmask);
@@ -4052,22 +4060,17 @@ iwn_set_link_quality(struct iwn_softc *sc, struct ieee80211_node *ni)
     linkq.ampdu_threshold = 3;
     linkq.ampdu_limit = htole16(4000);    /* 4ms */
 
-    if (ic->ic_flags & IEEE80211_F_USEPROT)
-        if (sc->hw_type != IWN_HW_REV_TYPE_4965)
+#if 0 // RTS/CTS protection not yet tested
+    if (ni->ni_flags & IEEE80211_NODE_HT &&
+        sc->agg_queue_mask > 0 &&
+        ic->ic_flags & IEEE80211_F_USEPROT)
+        if (sc->hw_type != IWN_HW_REV_TYPE_4965 &&
+            sc->hw_type != IWN_HW_REV_TYPE_5300 &&
+            sc->hw_type != IWN_HW_REV_TYPE_5150 &&
+            sc->hw_type != IWN_HW_REV_TYPE_5350 &&
+            sc->hw_type != IWN_HW_REV_TYPE_5100)
             linkq.flags |= IWN_LINK_QUAL_FLAGS_SET_STA_TLC_RTS;
-
-    if (ieee80211_node_supports_ht_sgi20(ni)) {
-        sgi_ok = 1;
-    }
-    
-    if (ni->ni_chw == IEEE80211_CHAN_WIDTH_40) {
-        is_40mhz = 1;
-        if (ieee80211_node_supports_ht_sgi40(ni)) {
-            sgi_ok = 1;
-        } else {
-            sgi_ok = 0;
-        }
-    }
+#endif
     
     /*
      * Fill the LQ rate selection table with legacy and/or HT rates
@@ -4098,17 +4101,20 @@ iwn_set_link_quality(struct iwn_softc *sc, struct ieee80211_node *ni)
                 (!mimo && iwn_is_mimo_ht_plcp(ht_plcp)))
                 continue;
             for (i = ni->ni_txmcs; i >= 0; i--) {
-                if (isclr(ni->ni_rxmcs, i))
+                if (ic->ic_tx_mcs_set == IEEE80211_TX_MCS_SET_DEFINED &&
+                    isclr(ni->ni_rxmcs, i))
                     continue;
-                if (ridx == iwn_mcs2ridx[i]) {
-                    tab = ht_plcp;
-                    rflags |= IWN_RFLAG_MCS;
-                    if (sgi_ok)
-                        rflags |= IWN_RFLAG_SGI;
-                    if (is_40mhz)
-                        rflags |= IWN_RFLAG_HT40;
+                if (ridx != iwn_mcs2ridx[i])
+                    continue;
+                tab = ht_plcp;
+                rflags |= IWN_RFLAG_MCS;
+                /* First two Tx attempts may use 40MHz/SGI. */
+                if (j > 1)
                     break;
-                }
+                if (iwn_rxon_ht40_enabled(sc))
+                    rflags |= IWN_RFLAG_HT40;
+                if (ieee80211_ra_use_ht_sgi(ni))
+                    rflags |= IWN_RFLAG_SGI;
             }
         } else if (plcp != IWN_RATE_INVM_PLCP) {
             for (i = ni->ni_txrate; i >= 0; i--) {
